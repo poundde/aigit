@@ -67,32 +67,25 @@ sudo apt-get install build-essential zlib1g-dev libncurses-dev
 sudo pacman -S base-devel zlib ncurses
 
 # Build
-sh create.sh
+make -j$(nproc)
 
 # Build and install to /usr/local/bin
-sh create.sh install
+make install
 ```
-
-Or if you already have a clone:
-
-```sh
-make -j$(nproc)
-```
-
 ---
 
 ## Getting started with GitHub
 
 ```sh
 # One-time identity setup
-aigit config --global user.name "raute"
-aigit config --global user.email "you@github.email"
+aigit config --global user.name "you"
+aigit config --global user.email "you@example.com"
 
 # In your project
 aigit init
 aigit add .
 aigit commit -m "initial commit"
-aigit remote add origin git@github.com:raute/yourrepo.git
+aigit remote add origin git@github.com:you/repo.git
 aigit push
 ```
 
