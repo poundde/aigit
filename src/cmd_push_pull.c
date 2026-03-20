@@ -442,15 +442,16 @@ static int do_pull(int rd, int wr, const char *branch,
     return 0;
   }
 
-  /* Fast-forward check */
-  if (has_local && !sha1_is_zero(&local_sha)) {
+  /* Fast-forward check — skip for shallow fetches since we can't walk
+   * past the shallow boundary, and skip for initial clones (no local). */
+  if (has_local && !sha1_is_zero(&local_sha) && depth == 0) {
     struct sha1 walk = want_sha;
     int is_ff = 0;
-    for (int depth = 0; depth < 4096; depth++) {
+    for (int ff_depth = 0; ff_depth < 4096; ff_depth++) {
       if (strcmp(walk.hex, local_sha.hex) == 0) { is_ff = 1; break; }
-      struct commit c;
-      if (object_read_commit(&walk, &c) != 0 || !c.has_parent) break;
-      walk = c.parent;
+      struct commit co;
+      if (object_read_commit(&walk, &co) != 0 || !co.has_parent) break;
+      walk = co.parent;
     }
     if (!is_ff) {
       fprintf(stderr, "aigit: not a fast-forward; merge not implemented.\n");

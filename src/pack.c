@@ -493,22 +493,32 @@ static uint8_t *collect_pack_from_sideband(int fd, size_t *pack_len_out)
   while (1) {
     int n = pkt_read(&pr);
     if (n < 0) { free(pack); return NULL; }
-    if (pr.is_flush) break;
+    if (pr.is_flush) {
+      /* A flush before sideband starts separates shallow/unshallow lines
+       * from the actual pack stream — keep reading, don't stop. */
+      if (in_sideband) break;
+      continue;
+    }
     if (n == 0) continue;
 
     if (!in_sideband) {
       /*
-       * Plain protocol lines before sideband begins.
-       * "NAK\n", "ACK <sha> continue\n", etc.
-       * Sideband starts when band byte is 1, 2, or 3.
+       * Plain protocol lines before sideband begins:
+       * "shallow <sha>"  — depth boundary (depth clone)
+       * "unshallow <sha>"— boundary being removed
+       * "NAK"            — no common base found, server will send everything
+       * "ACK <sha>"      — server acknowledges a "have" line
+       * Sideband starts when the first byte is 1, 2, or 3.
        */
       uint8_t first = (uint8_t)pr.buf[0];
       if (first == 1 || first == 2 || first == 3) {
         in_sideband = 1;
         /* Fall through to sideband handling */
       } else {
-        /* Plain pkt-line: NAK / ACK / ready — print to stderr and continue */
-        if (strncmp(pr.buf, "NAK", 3) != 0)
+        if (strncmp(pr.buf, "NAK",       3) != 0 &&
+            strncmp(pr.buf, "shallow",   7) != 0 &&
+            strncmp(pr.buf, "unshallow", 9) != 0 &&
+            strncmp(pr.buf, "ACK",       3) != 0)
           fprintf(stderr, "aigit: server: %.*s\n", n, pr.buf);
         continue;
       }
