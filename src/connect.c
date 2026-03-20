@@ -118,6 +118,7 @@ int url_parse(const char *url, struct remote_url *out)
  * TCP connection helper
  * ------------------------------------------------------------------------- */
 
+static int tcp_connect(const char *host, int port) __attribute__((unused));
 static int tcp_connect(const char *host, int port)
 {
   char port_str[16];
@@ -289,139 +290,26 @@ int transport_open_ssh(struct transport *t,
 }
 
 /* -------------------------------------------------------------------------
- * HTTP transport
- * ------------------------------------------------------------------------- */
-
-/*
- * Open an HTTP/HTTPS connection and send the GET /info/refs request.
- * For HTTPS we exec `curl` as a subprocess since implementing TLS from
- * scratch is out of scope.  For plain HTTP we use a raw TCP socket.
+ * HTTP/HTTPS transport — all routed through curl
+ * -------------------------------------------------------------------------
  *
- * Returns a readable fd containing the response body, or -1 on error.
+ * We use curl for both plain HTTP and HTTPS.  This gives us:
+ *   - TLS for free
+ *   - Correct handling of chunked transfer encoding
+ *   - HTTP/2 support
+ *   - Redirect following
+ *   - Auth credential helpers (netrc, etc.)
+ *
+ * For GET (info/refs): curl writes response to a pipe we read from.
+ * For POST (upload-pack, receive-pack): we write the request body to
+ * curl's stdin via a pipe, curl POSTs it and writes the response to
+ * another pipe we read from.
  */
 
 /*
- * HTTP via raw TCP socket.
- * Sends the request and returns a fd positioned at the start of the
- * response body (after headers).
+ * Run curl to GET a URL.  Returns a readable fd of the response body.
  */
-static int http_get_raw(const char *host, int port,
-                         const char *path_and_query,
-                         const char *extra_headers)
-{
-  int fd = tcp_connect(host, port);
-  if (fd < 0) {
-    fprintf(stderr, "aigit: cannot connect to %s:%d\n", host, port);
-    return -1;
-  }
-
-  char req[4096];
-  int rlen = snprintf(req, sizeof(req),
-    "GET %s HTTP/1.1\r\n"
-    "Host: %s\r\n"
-    "User-Agent: aigit/1.0\r\n"
-    "Accept: application/x-git-upload-pack-advertisement\r\n"
-    "%s"
-    "Connection: close\r\n"
-    "\r\n",
-    path_and_query, host,
-    extra_headers ? extra_headers : "");
-
-  if (rlen < 0 || (size_t)rlen >= sizeof(req)) { close(fd); return -1; }
-
-  ssize_t w = write(fd, req, (size_t)rlen);
-  if (w != rlen) { close(fd); return -1; }
-
-  /* Read response headers, find end of headers */
-  char hdrbuf[8192];
-  size_t hlen = 0;
-  while (hlen < sizeof(hdrbuf) - 1) {
-    ssize_t r = read(fd, hdrbuf + hlen, 1);
-    if (r <= 0) break;
-    hlen++;
-    if (hlen >= 4 && memcmp(hdrbuf + hlen - 4, "\r\n\r\n", 4) == 0)
-      break;
-  }
-  hdrbuf[hlen] = '\0';
-
-  /* Check HTTP status */
-  if (strncmp(hdrbuf, "HTTP/1.", 7) != 0) { close(fd); return -1; }
-  int status = atoi(hdrbuf + 9);
-  if (status != 200) {
-    fprintf(stderr, "aigit: HTTP %d from server\n", status);
-    close(fd);
-    return -1;
-  }
-
-  return fd;  /* caller reads body directly */
-}
-
-/*
- * HTTP POST via raw TCP socket.
- * body/body_len is the request body.
- * Returns a fd positioned at the start of the response body.
- */
-static int http_post_raw(const char *host, int port,
-                          const char *path,
-                          const char *content_type,
-                          const uint8_t *body, size_t body_len)
-{
-  int fd = tcp_connect(host, port);
-  if (fd < 0) {
-    fprintf(stderr, "aigit: cannot connect to %s:%d\n", host, port);
-    return -1;
-  }
-
-  char req_hdr[2048];
-  int hlen = snprintf(req_hdr, sizeof(req_hdr),
-    "POST %s HTTP/1.1\r\n"
-    "Host: %s\r\n"
-    "User-Agent: aigit/1.0\r\n"
-    "Content-Type: %s\r\n"
-    "Content-Length: %zu\r\n"
-    "Accept: application/x-git-%s-result\r\n"
-    "Connection: close\r\n"
-    "\r\n",
-    path, host, content_type, body_len,
-    strstr(path, "receive-pack") ? "receive-pack" : "upload-pack");
-
-  if (hlen < 0 || (size_t)hlen >= sizeof(req_hdr)) { close(fd); return -1; }
-
-  if (write(fd, req_hdr, (size_t)hlen) != hlen) { close(fd); return -1; }
-
-  size_t written = 0;
-  while (written < body_len) {
-    ssize_t w = write(fd, body + written, body_len - written);
-    if (w <= 0) { close(fd); return -1; }
-    written += (size_t)w;
-  }
-
-  /* Skip response headers */
-  char hdrbuf[8192];
-  size_t hdrlen = 0;
-  while (hdrlen < sizeof(hdrbuf) - 1) {
-    ssize_t r = read(fd, hdrbuf + hdrlen, 1);
-    if (r <= 0) break;
-    hdrlen++;
-    if (hdrlen >= 4 && memcmp(hdrbuf + hdrlen - 4, "\r\n\r\n", 4) == 0)
-      break;
-  }
-  hdrbuf[hdrlen] = '\0';
-  int status = atoi(hdrbuf + 9);
-  if (status != 200) {
-    fprintf(stderr, "aigit: HTTP %d from server\n", status);
-    close(fd);
-    return -1;
-  }
-
-  return fd;
-}
-
-/*
- * For HTTPS: use curl as a subprocess, piping its stdout to us.
- * Returns a readable fd containing the response body.
- */
-static int https_get_via_curl(const char *url_str)
+static int curl_get(const char *url_str, const char *accept_header)
 {
   int pipefd[2];
   if (pipe(pipefd) != 0) return -1;
@@ -433,62 +321,85 @@ static int https_get_via_curl(const char *url_str)
     close(pipefd[0]);
     dup2(pipefd[1], STDOUT_FILENO);
     close(pipefd[1]);
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-    execlp("curl", "curl", "-s", "--fail",
-           "-H", "Accept: application/x-git-upload-pack-advertisement",
-           url_str, NULL);
+    /* Forward curl errors to terminal so auth failures are visible */
+    execlp("curl", "curl",
+           "-s", "--fail", "--location",
+           "-H", accept_header,
+           url_str,
+           NULL);
     _exit(127);
   }
 
   close(pipefd[1]);
-  return pipefd[0];
-}
-
-static int https_post_via_curl(const char *url_str,
-                                 const char *content_type,
-                                 const uint8_t *body, size_t body_len)
-{
-  /* Write body to a temp file so curl can read it */
-  char tmpfile[64];
-  snprintf(tmpfile, sizeof(tmpfile), "/tmp/aigit_post.%d", (int)getpid());
-  int tmpfd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (tmpfd < 0) return -1;
-  { ssize_t _w = write(tmpfd, body, body_len); (void)_w; }
-  close(tmpfd);
-
-  int pipefd[2];
-  if (pipe(pipefd) != 0) { unlink(tmpfile); return -1; }
-
-  pid_t pid = fork();
-  if (pid < 0) { close(pipefd[0]); close(pipefd[1]); unlink(tmpfile); return -1; }
-
-  if (pid == 0) {
-    close(pipefd[0]);
-    dup2(pipefd[1], STDOUT_FILENO);
-    close(pipefd[1]);
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-
-    char ct_hdr[256];
-    snprintf(ct_hdr, sizeof(ct_hdr), "Content-Type: %s", content_type);
-    execlp("curl", "curl", "-s", "--fail",
-           "-X", "POST",
-           "-H", ct_hdr,
-           "--data-binary", "@-",
-           "--data-binary", tmpfile,
-           url_str, NULL);
-    _exit(127);
-  }
-
-  close(pipefd[1]);
-  unlink(tmpfile);
   return pipefd[0];
 }
 
 /*
- * Open an HTTP connection for a GET /info/refs request.
- * Returns a readable fd.
+ * Run curl to POST body_len bytes from body[] to url_str.
+ * Returns a readable fd of the response body.
+ *
+ * We write the request body to curl via its stdin (--data-binary @-)
+ * so we never need a temp file.
+ */
+static int curl_post(const char *url_str,
+                      const char *content_type,
+                      const char *accept_header,
+                      const uint8_t *body, size_t body_len)
+{
+  int in_pipe[2];   /* parent writes request body → curl stdin  */
+  int out_pipe[2];  /* curl writes response       → parent reads */
+
+  if (pipe(in_pipe) != 0) return -1;
+  if (pipe(out_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]); return -1; }
+
+  char ct_hdr[256], ac_hdr[256];
+  snprintf(ct_hdr, sizeof(ct_hdr), "Content-Type: %s", content_type);
+  snprintf(ac_hdr, sizeof(ac_hdr), "Accept: %s", accept_header);
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    close(in_pipe[1]);
+    close(out_pipe[0]);
+    dup2(in_pipe[0],  STDIN_FILENO);
+    dup2(out_pipe[1], STDOUT_FILENO);
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    execlp("curl", "curl",
+           "-s", "--fail", "--location",
+           "-X", "POST",
+           "-H", ct_hdr,
+           "-H", ac_hdr,
+           "--data-binary", "@-",
+           url_str,
+           NULL);
+    _exit(127);
+  }
+
+  /* Parent: close unused ends */
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+
+  /* Write body to curl's stdin */
+  size_t written = 0;
+  while (written < body_len) {
+    ssize_t w = write(in_pipe[1], body + written, body_len - written);
+    if (w <= 0) break;
+    written += (size_t)w;
+  }
+  close(in_pipe[1]);  /* EOF signals curl to start the POST */
+
+  return out_pipe[0];
+}
+
+/*
+ * Open HTTP(S) transport for GET /info/refs.
+ * Stores transport state in t, returns readable fd in *fd_out.
  */
 int transport_open_http(struct transport *t,
                          const char *url, const char *service,
@@ -502,7 +413,9 @@ int transport_open_http(struct transport *t,
 
   strncpy(t->http_url,  url,     sizeof(t->http_url)  - 1);
   strncpy(t->http_host, ru.host, sizeof(t->http_host) - 1);
-  { size_t _pl = strnlen(ru.path, sizeof(t->http_path)-1); memcpy(t->http_path, ru.path, _pl); t->http_path[_pl] = '\0'; }
+  { size_t _pl = strnlen(ru.path, sizeof(t->http_path)-1);
+    memcpy(t->http_path, ru.path, _pl);
+    t->http_path[_pl] = '\0'; }
   t->http_port = ru.port;
   t->http_tls  = (strcmp(ru.scheme, "https") == 0 ||
                   strcmp(ru.scheme, "git+https") == 0) ? 1 : 0;
@@ -512,45 +425,31 @@ int transport_open_http(struct transport *t,
   snprintf(info_url, sizeof(info_url),
            "%s/info/refs?service=git-%.32s", url, service);
 
-  int fd;
-  if (t->http_tls) {
-    fd = https_get_via_curl(info_url);
-  } else {
-    char path_q[4096];
-    snprintf(path_q, sizeof(path_q),
-             "%s/info/refs?service=git-%.32s", ru.path, service);
-    fd = http_get_raw(ru.host, ru.port, path_q, NULL);
-  }
+  char accept_hdr[128];
+  snprintf(accept_hdr, sizeof(accept_hdr),
+           "Accept: application/x-git-%s-advertisement", service);
 
+  int fd = curl_get(info_url, accept_hdr);
   if (fd < 0) return -1;
   *fd_out = fd;
   return 0;
 }
 
 /*
- * Do an HTTP POST to the service endpoint.
- * Returns a readable fd containing the server's response body.
+ * HTTP(S) POST to the service endpoint.
+ * Returns a readable fd of the response body.
  */
 int transport_http_post(struct transport *t,
                          const char *service,
                          const uint8_t *body, size_t body_len,
                          int *fd_out)
 {
-  char ct[128];
-  snprintf(ct, sizeof(ct), "application/x-git-%s-request", service);
-
-  char endpoint[8192];
+  char ct[128], accept[128], endpoint[8192];
+  snprintf(ct,       sizeof(ct),       "application/x-git-%s-request",  service);
+  snprintf(accept,   sizeof(accept),   "application/x-git-%s-result",   service);
   snprintf(endpoint, sizeof(endpoint), "%s/git-%.32s", t->http_url, service);
 
-  int fd;
-  if (t->http_tls) {
-    fd = https_post_via_curl(endpoint, ct, body, body_len);
-  } else {
-    char path[4096];
-    snprintf(path, sizeof(path), "%s/git-%.32s", t->http_path, service);
-    fd = http_post_raw(t->http_host, t->http_port, path, ct, body, body_len);
-  }
-
+  int fd = curl_post(endpoint, ct, accept, body, body_len);
   if (fd < 0) return -1;
   *fd_out = fd;
   return 0;

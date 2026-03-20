@@ -418,7 +418,7 @@ int cmd_push(int argc, char **argv)
 /* -- PULL -- */
 
 static int do_pull(int rd, int wr, const char *branch,
-                    int is_http, struct transport *http_t)
+                    int is_http, struct transport *http_t, int depth)
 {
   struct ref_list rl;
   if (read_ref_advertisements(rd, &rl) != 0) {
@@ -465,6 +465,8 @@ static int do_pull(int rd, int wr, const char *branch,
     pack_buf_init(&req);
     pb_pkt_writef(&req, "want %s multi_ack_detailed side-band-64k ofs-delta\n",
                   want_sha.hex);
+    if (depth > 0)
+      pb_pkt_writef(&req, "deepen %d\n", depth);
     if (has_local) {
       struct sha1 hw = local_sha;
       for (int d = 0; d < 32 && !sha1_is_zero(&hw); d++) {
@@ -487,6 +489,8 @@ static int do_pull(int rd, int wr, const char *branch,
     /* SSH */
     pkt_writef(wr, "want %s multi_ack_detailed side-band-64k ofs-delta\n",
                want_sha.hex);
+    if (depth > 0)
+      pkt_writef(wr, "deepen %d\n", depth);
     if (has_local) {
       struct sha1 hw = local_sha;
       for (int d = 0; d < 32 && !sha1_is_zero(&hw); d++) {
@@ -569,9 +573,22 @@ int cmd_pull(int argc, char **argv)
   const char *remote_name = "origin";
   const char *branch = NULL;
   char branch_buf[256];
-  if (argc >= 2) remote_name = argv[1];
-  if (argc >= 3) { branch = argv[2]; }
-  else {
+  int depth = 0;
+
+  int n_pos = 0;  /* count of positional args seen */
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "--depth=", 8) == 0) {
+      depth = atoi(argv[i] + 8);
+    } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
+      depth = atoi(argv[++i]);
+    } else if (argv[i][0] != '-') {
+      if (n_pos == 0) remote_name = argv[i];
+      else if (n_pos == 1) branch = argv[i];
+      n_pos++;
+    }
+  }
+
+  if (!branch) {
     if (refs_read_head(branch_buf, sizeof(branch_buf)) != 0) {
       fprintf(stderr, "aigit: cannot determine current branch\n");
       return 1;
@@ -610,7 +627,7 @@ int cmd_pull(int argc, char **argv)
     struct transport t; memset(&t, 0, sizeof(t));
     if (transport_open_ssh(&t, ru.user, ru.host, ru.path, "upload-pack") != 0)
       return 1;
-    int rc = do_pull(t.ssh_in, t.ssh_out, branch, 0, NULL);
+    int rc = do_pull(t.ssh_in, t.ssh_out, branch, 0, NULL, depth);
     transport_close(&t);
     return rc;
   } else if (strcmp(ru.scheme, "http") == 0 || strcmp(ru.scheme, "https") == 0 ||
@@ -619,7 +636,7 @@ int cmd_pull(int argc, char **argv)
     int info_fd;
     if (transport_open_http(&t, url, "upload-pack", &info_fd) != 0)
       return 1;
-    int rc = do_pull(info_fd, -1, branch, 1, &t);
+    int rc = do_pull(info_fd, -1, branch, 1, &t, depth);
     close(info_fd);
     return rc;
   }
