@@ -49,7 +49,7 @@ aigit remote add <name> <url>       add a remote
 aigit remote remove <name>          remove a remote
 aigit remote [-v]                   list remotes
 aigit push [<remote> [<branch>]]    push to remote (SSH or HTTP/HTTPS)
-aigit pull [<remote> [<branch>]]    pull from remote (fast-forward only)
+aigit pull [--depth=N] [<remote> [<branch>]]    pull from remote (fast-forward only)
 aigit config --global user.name "you"
 aigit config --global user.email "you@example.com"
 ```
