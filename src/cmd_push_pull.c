@@ -5,6 +5,8 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 
 /* write() wrapper that explicitly discards the return value */
@@ -94,6 +96,8 @@ static int read_ref_advertisements(int fd, struct ref_list *rl)
 
     size_t rlen = nul ? (size_t)(nul - refname) : strnlen(refname, 255);
     if (rlen >= 256) rlen = 255;
+    /* Strip trailing \n that git appends to plain ref lines */
+    while (rlen > 0 && refname[rlen - 1] == '\n') rlen--;
     memcpy(rl->names[rl->count], refname, rlen);
     rl->names[rl->count][rlen] = '\0';
 
@@ -417,6 +421,41 @@ int cmd_push(int argc, char **argv)
 
 /* -- PULL -- */
 
+/*
+ * Recursively walk the working directory and add every regular file
+ * to idx.  Used after a pull to rebuild the staging index.
+ * Skips .git/ and any path starting with a dot.
+ */
+static void rebuild_index_from_dir(struct index *idx, const char *base)
+{
+  DIR *d = opendir(base);
+  if (!d) return;
+
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (strcmp(de->d_name, ".")    == 0 ||
+        strcmp(de->d_name, "..")   == 0 ||
+        strcmp(de->d_name, ".git") == 0)
+      continue;
+
+    char path[MAX_PATH];
+    if (strcmp(base, ".") == 0)
+      snprintf(path, sizeof(path), "%s", de->d_name);
+    else
+      snprintf(path, sizeof(path), "%s/%s", base, de->d_name);
+
+    struct stat st;
+    if (lstat(path, &st) != 0) continue;
+
+    if (S_ISDIR(st.st_mode)) {
+      rebuild_index_from_dir(idx, path);
+    } else if (S_ISREG(st.st_mode)) {
+      index_add(idx, path);
+    }
+  }
+  closedir(d);
+}
+
 static int do_pull(int rd, int wr, const char *branch,
                     int is_http, struct transport *http_t, int depth)
 {
@@ -533,29 +572,12 @@ static int do_pull(int rd, int wr, const char *branch,
     return 1;
   }
 
-  /* Rebuild index from tree */
+  /* Rebuild index by walking the working tree recursively.
+   * object_restore_tree already wrote every file to disk, so we
+   * just need to add each file to the index via index_add. */
   struct index new_idx;
   index_init(&new_idx);
-  char *ttype = NULL; uint8_t *tdata = NULL; size_t tlen = 0;
-  if (object_read(&target.tree, &ttype, &tdata, &tlen) == 0) {
-    size_t off = 0;
-    while (off < tlen) {
-      uint8_t *sp = memchr(tdata + off, ' ', tlen - off);
-      if (!sp) break;
-      off = (size_t)(sp - tdata) + 1;
-      uint8_t *nul = memchr(tdata + off, '\0', tlen - off);
-      if (!nul) break;
-      size_t nlen = (size_t)(nul - (tdata + off));
-      if (nlen < MAX_PATH) {
-        char name[MAX_PATH];
-        memcpy(name, tdata + off, nlen);
-        name[nlen] = '\0';
-        index_add(&new_idx, name);
-      }
-      off = (size_t)(nul - tdata) + 1 + SHA1_BIN_LEN;
-    }
-    free(ttype); free(tdata);
-  }
+  rebuild_index_from_dir(&new_idx, ".");
   index_write(&new_idx);
   index_free(&new_idx);
 

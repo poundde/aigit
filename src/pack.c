@@ -234,22 +234,15 @@ int pack_build(struct pack_buf *pb, struct sha1 *shas, size_t n_shas)
  */
 
 /*
- * A resolved object: type name + raw content (not the git object wrapper —
- * just the actual file/tree/commit bytes).
- */
-struct resolved_obj {
-  char     type[16];
-  uint8_t *data;
-  size_t   len;
-};
-
-/*
- * Position index entry: maps a pack byte offset to a resolved object.
- * We keep a growable array sorted by pack offset.
+ * Position index: maps pack byte offset -> pack byte offset.
+ * We only store the offset so we can re-inflate base objects on demand
+ * rather than keeping all decompressed content in memory simultaneously.
+ * For a large pack (git/git ~13MB compressed, ~50MB+ uncompressed) keeping
+ * all content would exhaust available RAM.
  */
 struct pos_entry {
-  size_t             pack_off;
-  struct resolved_obj obj;
+  size_t pack_off;   /* start of this object in the pack buffer */
+  char   type[16];   /* resolved type name (follows delta chains) */
 };
 
 struct pos_index {
@@ -268,15 +261,12 @@ static int pos_index_init(struct pos_index *pi)
 
 static void pos_index_free(struct pos_index *pi)
 {
-  for (size_t i = 0; i < pi->count; i++)
-    free(pi->entries[i].obj.data);
   free(pi->entries);
   pi->entries = NULL;
   pi->count   = pi->cap = 0;
 }
 
-static int pos_index_add(struct pos_index *pi, size_t pack_off,
-                          const char *type, uint8_t *data, size_t len)
+static int pos_index_add(struct pos_index *pi, size_t pack_off, const char *type)
 {
   if (pi->count >= pi->cap) {
     size_t new_cap = pi->cap * 2;
@@ -286,20 +276,97 @@ static int pos_index_add(struct pos_index *pi, size_t pack_off,
     pi->cap     = new_cap;
   }
   pi->entries[pi->count].pack_off = pack_off;
-  strncpy(pi->entries[pi->count].obj.type, type,
-          sizeof(pi->entries[pi->count].obj.type) - 1);
-  pi->entries[pi->count].obj.type[15] = '\0';
-  pi->entries[pi->count].obj.data = data;
-  pi->entries[pi->count].obj.len  = len;
+  strncpy(pi->entries[pi->count].type, type, 15);
+  pi->entries[pi->count].type[15] = '\0';
   pi->count++;
   return 0;
 }
 
-static struct resolved_obj *pos_index_find(struct pos_index *pi, size_t pack_off)
+static struct pos_entry *pos_index_find(struct pos_index *pi, size_t pack_off)
+  __attribute__((unused));
+static struct pos_entry *pos_index_find(struct pos_index *pi, size_t pack_off)
 {
   for (size_t i = 0; i < pi->count; i++)
     if (pi->entries[i].pack_off == pack_off)
-      return &pi->entries[i].obj;
+      return &pi->entries[i];
+  return NULL;
+}
+
+/* Forward declarations needed by pack_read_object_at */
+static uint8_t *zlib_inflate(const uint8_t *buf, size_t buf_len,
+                               size_t *consumed, size_t *out_len);
+static uint8_t *apply_delta(const uint8_t *delta, size_t delta_len,
+                              const uint8_t *base, size_t base_len,
+                              size_t *result_len);
+
+/*
+ * Re-inflate an object at pack_off from the pack buffer.
+ * Follows OFS_DELTA chains recursively to resolve the base type.
+ * Returns malloc'd content, sets *type_out and *content_len.
+ */
+static uint8_t *pack_read_object_at(const uint8_t *pack, size_t pack_len,
+                                     size_t pack_off, const char **type_out,
+                                     size_t *content_len,
+                                     struct pos_index *pi,
+                                     int depth);
+
+static uint8_t *pack_read_object_at(const uint8_t *pack, size_t pack_len,
+                                     size_t pack_off, const char **type_out,
+                                     size_t *content_len,
+                                     struct pos_index *pi,
+                                     int depth)
+{
+  if (depth > 64 || pack_off >= pack_len) return NULL;
+
+  size_t off = pack_off;
+  uint8_t b = pack[off++];
+  int pack_type = (b >> 4) & 7;
+  size_t obj_size = b & 0x0f; int shift = 4;
+  while (b & 0x80 && off < pack_len) {
+    b = pack[off++];
+    obj_size |= (size_t)(b & 0x7f) << shift; shift += 7;
+  }
+  (void)obj_size;
+
+  static const char *type_names[] = {
+    NULL, OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, "tag", NULL, NULL, NULL
+  };
+
+  if (pack_type >= 1 && pack_type <= 4) {
+    size_t consumed = 0;
+    uint8_t *content = zlib_inflate(pack + off, pack_len - off,
+                                     &consumed, content_len);
+    if (type_out) *type_out = type_names[pack_type];
+    return content;
+  }
+
+  if (pack_type == PACK_OBJ_OFS_DELTA) {
+    b = pack[off++];
+    size_t neg = b & 0x7f;
+    while (b & 0x80 && off < pack_len) {
+      b = pack[off++];
+      neg = ((neg + 1) << 7) | (b & 0x7f);
+    }
+    size_t base_pos = pack_off - neg;
+
+    /* Get base content recursively */
+    const char *base_type = NULL;
+    size_t base_len = 0;
+    uint8_t *base = pack_read_object_at(pack, pack_len, base_pos,
+                                         &base_type, &base_len, pi, depth+1);
+    if (!base) return NULL;
+
+    size_t consumed = 0, delta_len = 0;
+    uint8_t *delta = zlib_inflate(pack + off, pack_len - off,
+                                   &consumed, &delta_len);
+    if (!delta) { free(base); return NULL; }
+
+    uint8_t *result = apply_delta(delta, delta_len, base, base_len, content_len);
+    free(delta); free(base);
+    if (type_out) *type_out = base_type;
+    return result;
+  }
+
   return NULL;
 }
 
@@ -315,35 +382,57 @@ static uint8_t *zlib_inflate(const uint8_t *buf, size_t buf_len,
   memset(&zs, 0, sizeof(zs));
   if (inflateInit(&zs) != Z_OK) return NULL;
 
-  size_t out_cap = 4096;
+  size_t out_cap = 65536;
   uint8_t *out   = malloc(out_cap);
   if (!out) { inflateEnd(&zs); return NULL; }
   size_t out_used = 0;
 
+  /*
+   * Point zlib at the entire input buffer.  inflate() reads as much as
+   * it needs and leaves avail_in with the leftover byte count, so
+   * consumed = buf_len - avail_in after Z_STREAM_END.
+   *
+   * We cap avail_in at UINT_MAX (4 GiB) — packs larger than that are
+   * not realistic for a single object's compressed payload.
+   */
   zs.next_in  = (Bytef *)buf;
-  zs.avail_in = (uInt)(buf_len > 0x7fffffff ? 0x7fffffff : buf_len);
+  zs.avail_in = (uInt)(buf_len > 0xffffffffu ? 0xffffffffu : buf_len);
 
+  int inflate_rc = Z_OK;
   while (1) {
-    zs.next_out  = out + out_used;
-    zs.avail_out = (uInt)(out_cap - out_used);
-    int rc = inflate(&zs, Z_SYNC_FLUSH);
-    out_used = out_cap - zs.avail_out;
-
-    if (rc == Z_STREAM_END) break;
-    if (rc == Z_BUF_ERROR && zs.avail_out == 0) {
-      /* Need more output space */
+    /* Grow output buffer if needed */
+    if (out_used >= out_cap) {
       out_cap *= 2;
       uint8_t *tmp = realloc(out, out_cap);
       if (!tmp) { free(out); inflateEnd(&zs); return NULL; }
       out = tmp;
-      continue;
     }
-    if (rc != Z_OK) { free(out); inflateEnd(&zs); return NULL; }
+
+    zs.next_out  = out + out_used;
+    zs.avail_out = (uInt)(out_cap - out_used);
+
+    inflate_rc = inflate(&zs, Z_NO_FLUSH);
+    out_used = out_cap - zs.avail_out;
+
+    if (inflate_rc == Z_STREAM_END) break;
+    if (inflate_rc == Z_BUF_ERROR) continue;
+    if (inflate_rc != Z_OK) break;  /* error — but still report consumed */
   }
 
-  *consumed = buf_len - zs.avail_in;
+  /*
+   * Always report how many input bytes were consumed, even on error.
+   * This lets the caller advance past a corrupt object rather than
+   * re-parsing from the same position indefinitely.
+   */
+  size_t capped = (buf_len > 0xffffffffu ? 0xffffffffu : buf_len);
+  *consumed = capped - zs.avail_in;
   *out_len  = out_used;
   inflateEnd(&zs);
+
+  if (inflate_rc != Z_STREAM_END) {
+    free(out);
+    return NULL;
+  }
   return out;
 }
 
@@ -626,8 +715,12 @@ static int unpack_pack_data(const uint8_t *pack, size_t pack_len)
       off += consumed;
       if (!delta) { fprintf(stderr, "aigit: OFS_DELTA inflate failed\n"); continue; }
 
-      struct resolved_obj *base = pos_index_find(&pi, base_pos);
-      if (!base) {
+      /* Re-inflate base from the pack buffer on demand */
+      const char *base_type = NULL;
+      size_t base_len = 0;
+      uint8_t *base_data = pack_read_object_at(pack, pack_len, base_pos,
+                                                &base_type, &base_len, &pi, 0);
+      if (!base_data) {
         fprintf(stderr, "aigit: OFS_DELTA base not found at %zu\n", base_pos);
         free(delta);
         continue;
@@ -635,18 +728,14 @@ static int unpack_pack_data(const uint8_t *pack, size_t pack_len)
 
       size_t result_len = 0;
       uint8_t *result = apply_delta(delta, delta_len,
-                                     base->data, base->len, &result_len);
-      free(delta);
+                                     base_data, base_len, &result_len);
+      free(delta); free(base_data);
       if (!result) { fprintf(stderr, "aigit: delta apply failed\n"); continue; }
 
       struct sha1 sha;
-      if (store_object(base->type, result, result_len, &sha) == 0) {
-        /* Keep a copy in the position index for potential chained deltas */
-        uint8_t *copy = malloc(result_len);
-        if (copy) {
-          memcpy(copy, result, result_len);
-          pos_index_add(&pi, obj_start, base->type, copy, result_len);
-        }
+      if (store_object(base_type, result, result_len, &sha) == 0) {
+        /* Record this object's position for future delta chains */
+        pos_index_add(&pi, obj_start, base_type);
         stored++;
       }
       free(result);
@@ -686,11 +775,7 @@ static int unpack_pack_data(const uint8_t *pack, size_t pack_len)
 
       struct sha1 sha;
       if (store_object(base_type, result, result_len, &sha) == 0) {
-        uint8_t *copy = malloc(result_len);
-        if (copy) {
-          memcpy(copy, result, result_len);
-          pos_index_add(&pi, obj_start, base_type, copy, result_len);
-        }
+        pos_index_add(&pi, obj_start, base_type);
         stored++;
       }
       free(result); free(base_type);
@@ -710,11 +795,8 @@ static int unpack_pack_data(const uint8_t *pack, size_t pack_len)
 
       struct sha1 sha;
       if (store_object(type_name, content, content_len, &sha) == 0) {
-        uint8_t *copy = malloc(content_len);
-        if (copy) {
-          memcpy(copy, content, content_len);
-          pos_index_add(&pi, obj_start, type_name, copy, content_len);
-        }
+        /* Record position for potential OFS_DELTA lookups */
+        pos_index_add(&pi, obj_start, type_name);
         stored++;
       }
       free(content);

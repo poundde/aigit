@@ -619,7 +619,10 @@ int object_restore_tree(const struct sha1 *tree_sha, const char *prefix)
     else
       snprintf(path, sizeof(path), "%s/%s", prefix, name);
 
-    if (S_ISDIR(mode)) {
+    if ((mode & 0170000) == 0160000) {
+      /* Gitlink (submodule pointer) — skip, we don't fetch submodules */
+      continue;
+    } else if (S_ISDIR(mode)) {
       /* Subtree: recurse */
       if (util_mkdir_p(path) != 0) {
         rc = -1;

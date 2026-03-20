@@ -73,9 +73,13 @@ int pkt_read(struct pkt_reader *r)
   if (read_full(r->fd, r->buf, payload) != 0)
     return -1;
 
-  /* Strip trailing newline that git conventionally appends */
-  if (payload > 0 && r->buf[payload - 1] == '\n')
-    payload--;
+  /*
+   * Git appends '\n' to text pkt-lines (ref advertisements, NAK, etc.)
+   * but NOT to sideband binary data.  We must NOT strip here because the
+   * caller cannot distinguish binary pack data from text — stripping a
+   * legitimate 0x0a byte from a sideband band-1 packet corrupts the pack
+   * stream.  Callers that want to strip '\n' from text lines do so themselves.
+   */
 
   r->buf[payload] = '\0';
   r->len = payload;

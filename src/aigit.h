@@ -206,6 +206,7 @@ int  object_restore_tree(const struct sha1 *tree_sha, const char *prefix);
 /* --- cmd_*.c (branching additions) -------------------------------------- */
 int  cmd_branch(int argc, char **argv);
 int  cmd_checkout(int argc, char **argv);
+int  cmd_clone(int argc, char **argv);
 int  cmd_config(int argc, char **argv);
 /* --- cmd_remote / cmd_push / cmd_pull ----------------------------------- */
 int  cmd_remote(int argc, char **argv);

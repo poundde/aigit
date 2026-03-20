@@ -20,7 +20,8 @@ static const struct command commands[] = {
   { "config",   cmd_config,   "aigit config [--global] <key> [<val>]"},
   { "remote",   cmd_remote,   "aigit remote [add|remove] [<n> <url>]"},
   { "push",     cmd_push,     "aigit push [<remote> [<branch>]]"      },
-  { "pull",     cmd_pull,     "aigit pull [--depth=N] [<remote> [<branch>]]"      },
+  { "pull",     cmd_pull,     "aigit pull [--depth=N] [<remote> [<branch>]]"},
+  { "clone",    cmd_clone,    "aigit clone [--branch=<branch>] [--depth=N] <url> [<dir>]"       },
   { NULL, NULL, NULL },
 };
 
